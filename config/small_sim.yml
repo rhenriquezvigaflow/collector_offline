@@ -1,0 +1,34 @@
+# Plantilla local compatible con los YAML del Collector Central.
+# Copie este archivo, cambie los datos de la laguna y selecciónelo mediante
+# plcs[].include en collector-offline.yml.
+lagoon_id: "small_sim"
+product_type: "small"
+
+# Selector de PLC. Valores soportados: rockwell o siemens.
+source: rockwell
+poll_seconds: 1
+timezone: "America/Santiago"
+
+force_reconnect_every_sec: 3600
+max_consecutive_fails: 10
+
+# Se conserva por compatibilidad copy/paste con el Collector Central.
+# El Collector Offline ignora este endpoint realtime.
+backend:
+  url: "http://127.0.0.1:8090/ingest/scada"
+
+rockwell:
+  ip: "192.168.100.11"
+  slot: 0
+  timeout_sec: 5
+
+# Clave: identificador lógico enviado al backend.
+# Valor: dirección/tag real dentro del PLC Rockwell.
+tags:
+  motor: "Motor"
+  partir: "Partir"
+
+# Opcional. Usa el mismo contrato del Collector Central y fuerza la creación
+# de eventos para los tags indicados.
+# event_tags:
+#   P006_ST: "Bomba de filtración"

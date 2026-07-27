@@ -1,0 +1,60 @@
+version: 1
+
+node:
+  source_node_id: "edge-small-sim-01"
+  lagoon_id: "small_sim"
+  product_type: "small"
+
+database:
+  url_env: "COLLECTOR_OFFLINE_DATABASE_URL"
+  statement_timeout_ms: 10000
+  lock_timeout_ms: 2000
+  pool_size: 5
+
+central:
+  health_url: "http://192.168.2.100:8090/health/ready"
+  sync_url: "http://192.168.2.100:8090/ingest/offline/v1/backfill"
+  token_env: "COLLECTOR_OFFLINE_TOKEN"
+  timeout_sec: 10
+  verify_tls: true
+  # Excepción explícita: backend central accesible solo por red privada en planta.
+  allow_private_http: true
+  health_attempts: 2
+  health_backoff_base_sec: 0.5
+
+supervisor:
+  health_interval_sec: 60
+  failure_threshold: 3
+  recovery_threshold: 2
+  syncing_failure_threshold: 1
+  runtime_tick_sec: 1
+
+capture:
+  interval_sec: 60
+
+sync:
+  batch_size: 250
+  lease_sec: 120
+  max_attempts: 10
+  backoff_base_sec: 2
+  backoff_max_sec: 300
+  idle_interval_sec: 2
+
+retention:
+  enabled: true
+  days: 90
+  batch_size: 1000
+  interval_sec: 3600
+
+status_server:
+  enabled: true
+  host: "127.0.0.1"
+  port: 9187
+
+logging:
+  level: "INFO"
+  json: true
+
+plcs:
+  # Copia local autosuficiente de la definición oficial de esta laguna.
+  - include: "small_sim.yml"
