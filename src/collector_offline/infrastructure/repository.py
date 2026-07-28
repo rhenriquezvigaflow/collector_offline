@@ -1,20 +1,15 @@
 from __future__ import annotations
 
-import random
-from collections import Counter
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
-from collector_offline.config import RetentionConfig, SupervisorConfig, SyncConfig
+from collector_offline.config import RetentionConfig, SupervisorConfig
 from collector_offline.domain.models import (
-    AckStatus,
-    BackfillRecord,
-    BackfillResponse,
     HealthResult,
     NodeState,
     SessionStatus,
@@ -85,7 +80,6 @@ class EdgeRepository:
                 row.recovery_count = 0
                 row.last_error = "recovered inconsistent runtime state without active outage"
 
-            self._recover_expired_leases(db, datetime.now(UTC))
             return self._snapshot(row)
 
     def snapshot(self) -> StateSnapshot:
@@ -130,7 +124,7 @@ class EdgeRepository:
                 if before == NodeState.OFFLINE:
                     row.recovery_count += 1
                     if row.recovery_count >= thresholds.recovery_threshold:
-                        self._enter_syncing(db, row, result.checked_at, reason)
+                        self._enter_syncing(db, row, result.checked_at)
                 elif before == NodeState.ONLINE:
                     row.recovery_count = 0
             else:
@@ -142,7 +136,7 @@ class EdgeRepository:
                     before == NodeState.SYNCING
                     and row.failure_count >= thresholds.syncing_failure_threshold
                 ):
-                    self._return_to_offline(db, row, reason)
+                    self._return_to_offline(db, row)
 
             after = NodeState(row.state)
             return TransitionResult(
@@ -164,7 +158,6 @@ class EdgeRepository:
             started_at=started_at,
             status=SessionStatus.OFFLINE.value,
             failure_reason=_truncated_error(reason),
-            diagnostic_metadata={"initial_failure_reason": reason},
         )
         db.add(session)
         db.flush()
@@ -174,7 +167,7 @@ class EdgeRepository:
         row.recovery_count = 0
 
     def _enter_syncing(
-        self, db: Session, row: RuntimeStateRow, restored_at: datetime, reason: str
+        self, db: Session, row: RuntimeStateRow, restored_at: datetime
     ) -> None:
         if row.current_session_id is None:
             raise RuntimeError("cannot enter syncing without an outage session")
@@ -187,11 +180,10 @@ class EdgeRepository:
         open_events = db.execute(
             select(LocalScadaEventRow).where(
                 LocalScadaEventRow.outage_session_id == session.id,
-                LocalScadaEventRow.is_open.is_(True),
+                LocalScadaEventRow.ended_at.is_(None),
             )
         ).scalars()
         for event in open_events:
-            event.is_open = False
             event.ended_at = restored_at
             event.sync_status = SyncStatus.PENDING.value
             event.sync_attempts = 0
@@ -204,15 +196,12 @@ class EdgeRepository:
 
         session.connectivity_restored_at = restored_at
         session.status = SessionStatus.SYNCING.value
-        metadata = dict(session.diagnostic_metadata or {})
-        metadata["last_recovery_reason"] = reason
-        session.diagnostic_metadata = metadata
         row.state = NodeState.SYNCING.value
         row.failure_count = 0
         row.recovery_count = 0
 
     @staticmethod
-    def _return_to_offline(db: Session, row: RuntimeStateRow, reason: str) -> None:
+    def _return_to_offline(db: Session, row: RuntimeStateRow) -> None:
         if row.current_session_id is None:
             raise RuntimeError("cannot return offline without an outage session")
         session = db.get(OutageSessionRow, row.current_session_id)
@@ -220,9 +209,6 @@ class EdgeRepository:
             raise RuntimeError("current outage session does not exist")
         session.status = SessionStatus.OFFLINE.value
         session.connectivity_restored_at = None
-        metadata = dict(session.diagnostic_metadata or {})
-        metadata["sync_interrupted_reason"] = reason
-        session.diagnostic_metadata = metadata
         row.state = NodeState.OFFLINE.value
         row.failure_count = 0
         row.recovery_count = 0
@@ -302,14 +288,12 @@ class EdgeRepository:
                     db.add(
                         LocalScadaMinuteRow(
                             outage_session_id=session_id,
-                            source_node_id=self.source_node_id,
                             lagoon_id=observation.lagoon_id,
                             tag_id=observation.tag_id,
                             bucket=observation.bucket,
                             state=observation.value.state,
                             value_num=observation.value.value_num,
                             value_bool=observation.value.value_bool,
-                            quality=observation.quality.value,
                             captured_at=observation.captured_at,
                         )
                     )
@@ -326,21 +310,17 @@ class EdgeRepository:
                             lagoon_id=observation.lagoon_id,
                             tag_id=observation.tag_id,
                             last_value=next_state,
-                            last_changed_at=observation.captured_at,
-                            last_observed_at=observation.captured_at,
                         )
                     )
                     continue
 
-                state_row.last_observed_at = observation.captured_at
                 if state_row.last_value == next_state:
                     continue
 
                 if state_row.open_event_id:
                     open_event = db.get(LocalScadaEventRow, state_row.open_event_id)
-                    if open_event and open_event.is_open:
+                    if open_event and open_event.ended_at is None:
                         open_event.ended_at = observation.captured_at
-                        open_event.is_open = False
                         open_event.sync_status = SyncStatus.PENDING.value
                         open_event.sync_attempts = 0
                         open_event.next_retry_at = None
@@ -349,210 +329,20 @@ class EdgeRepository:
 
                 event = LocalScadaEventRow(
                     outage_session_id=session_id,
-                    source_node_id=self.source_node_id,
                     lagoon_id=observation.lagoon_id,
                     tag_id=observation.tag_id,
                     tag_label=label or observation.tag_id,
                     previous_state=state_row.last_value,
                     state=next_state,
                     started_at=observation.captured_at,
-                    is_open=True,
                 )
                 db.add(event)
                 db.flush()
                 state_row.last_value = next_state
-                state_row.last_changed_at = observation.captured_at
                 state_row.open_event_id = event.id
                 event_count += 1
 
         return (minute_count, event_count)
-
-    def claim_backlog(
-        self, now: datetime, config: SyncConfig, lease_token: UUID | None = None
-    ) -> list[BackfillRecord]:
-        token = lease_token or uuid4()
-        lease_until = now + timedelta(seconds=config.lease_sec)
-        with self.database.session() as db, db.begin():
-            self._recover_expired_leases(db, now)
-            minute_rows = list(
-                db.execute(
-                    select(LocalScadaMinuteRow)
-                    .where(
-                        LocalScadaMinuteRow.sync_status == SyncStatus.PENDING.value,
-                        or_(
-                            LocalScadaMinuteRow.next_retry_at.is_(None),
-                            LocalScadaMinuteRow.next_retry_at <= now,
-                        ),
-                    )
-                    .order_by(LocalScadaMinuteRow.bucket, LocalScadaMinuteRow.tag_id)
-                    .limit(config.batch_size)
-                    .with_for_update(skip_locked=True)
-                ).scalars()
-            )
-            event_rows = list(
-                db.execute(
-                    select(LocalScadaEventRow)
-                    .where(
-                        LocalScadaEventRow.sync_status == SyncStatus.PENDING.value,
-                        or_(
-                            LocalScadaEventRow.next_retry_at.is_(None),
-                            LocalScadaEventRow.next_retry_at <= now,
-                        ),
-                    )
-                    .order_by(LocalScadaEventRow.started_at, LocalScadaEventRow.tag_id)
-                    .limit(config.batch_size)
-                    .with_for_update(skip_locked=True)
-                ).scalars()
-            )
-            candidates: list[tuple[datetime, str, Any]] = [
-                (row.bucket, "minute", row) for row in minute_rows
-            ] + [(row.started_at, "event", row) for row in event_rows]
-            candidates.sort(key=lambda item: (item[0], item[1], str(item[2].id)))
-            selected = candidates[: config.batch_size]
-
-            records: list[BackfillRecord] = []
-            for _, kind, row in selected:
-                row.sync_status = SyncStatus.SYNCING.value
-                row.sync_attempts += 1
-                row.lease_until = lease_until
-                row.lease_token = token
-                row.last_sync_error = None
-                payload = (
-                    self._minute_payload(row) if kind == "minute" else self._event_payload(row)
-                )
-                records.append(
-                    BackfillRecord(
-                        kind=kind,
-                        local_id=row.id,
-                        payload=payload,
-                        attempts=row.sync_attempts,
-                        lease_token=token,
-                    )
-                )
-            return records
-
-    @staticmethod
-    def _recover_expired_leases(db: Session, now: datetime) -> int:
-        total = 0
-        for model in (LocalScadaMinuteRow, LocalScadaEventRow):
-            result = db.execute(
-                update(model)
-                .where(
-                    model.sync_status == SyncStatus.SYNCING.value,
-                    model.lease_until < now,
-                )
-                .values(
-                    sync_status=SyncStatus.PENDING.value,
-                    lease_until=None,
-                    lease_token=None,
-                    last_sync_error="recovered expired sync lease",
-                )
-            )
-            total += int(getattr(result, "rowcount", 0) or 0)
-        return total
-
-    def recover_expired_leases(self, now: datetime) -> int:
-        with self.database.session() as db, db.begin():
-            return self._recover_expired_leases(db, now)
-
-    @staticmethod
-    def _minute_payload(row: LocalScadaMinuteRow) -> dict[str, Any]:
-        return {
-            "local_id": str(row.id),
-            "outage_session_id": str(row.outage_session_id),
-            "tag_id": row.tag_id,
-            "bucket": _iso_utc(row.bucket),
-            "state": row.state,
-            "value_num": row.value_num,
-            "value_bool": row.value_bool,
-            "quality": row.quality,
-            "captured_at": _iso_utc(row.captured_at),
-        }
-
-    @staticmethod
-    def _event_payload(row: LocalScadaEventRow) -> dict[str, Any]:
-        duration = None
-        if row.ended_at is not None:
-            duration = max(0, int((row.ended_at - row.started_at).total_seconds()))
-        return {
-            "local_id": str(row.id),
-            "outage_session_id": str(row.outage_session_id),
-            "tag_id": row.tag_id,
-            "tag_label": row.tag_label,
-            "alert_type": row.alert_type,
-            "previous_state": row.previous_state,
-            "state": row.state,
-            "started_at": _iso_utc(row.started_at),
-            "ended_at": _iso_utc(row.ended_at) if row.ended_at else None,
-            "is_open": row.is_open,
-            "duration_sec": duration,
-        }
-
-    def finalize_claim(
-        self,
-        records: list[BackfillRecord],
-        response: BackfillResponse | None,
-        now: datetime,
-        config: SyncConfig,
-        transport_error: str | None = None,
-        transport_retryable: bool = True,
-    ) -> Counter[str]:
-        acknowledgements = {
-            (ack.kind, ack.local_id): ack for ack in (response.acknowledgements if response else [])
-        }
-        counts: Counter[str] = Counter()
-        latest_error: str | None = None
-        with self.database.session() as db, db.begin():
-            for record in records:
-                row: LocalScadaMinuteRow | LocalScadaEventRow | None
-                if record.kind == "minute":
-                    row = db.get(LocalScadaMinuteRow, record.local_id)
-                else:
-                    row = db.get(LocalScadaEventRow, record.local_id)
-                if (
-                    row is None
-                    or row.sync_status != SyncStatus.SYNCING.value
-                    or row.lease_token != record.lease_token
-                ):
-                    counts["lease_lost"] += 1
-                    continue
-                ack = acknowledgements.get((record.kind, record.local_id))
-                if ack and ack.status in {AckStatus.ACCEPTED, AckStatus.DUPLICATE}:
-                    row.sync_status = SyncStatus.SENT.value
-                    row.synced_at = now
-                    row.last_sync_error = None
-                    counts[ack.status.value] += 1
-                else:
-                    retryable = ack.retryable if ack else transport_retryable
-                    error = transport_error or (
-                        ack.detail if ack else "central response omitted record"
-                    )
-                    latest_error = error
-                    if not retryable or row.sync_attempts >= config.max_attempts:
-                        row.sync_status = SyncStatus.FAILED.value
-                        row.next_retry_at = None
-                        counts["failed"] += 1
-                    else:
-                        delay = min(
-                            config.backoff_base_sec * (2 ** max(0, row.sync_attempts - 1)),
-                            config.backoff_max_sec,
-                        )
-                        delay *= random.uniform(0.8, 1.2)
-                        row.sync_status = SyncStatus.PENDING.value
-                        row.next_retry_at = now + timedelta(seconds=delay)
-                        counts["pending"] += 1
-                    row.last_sync_error = _truncated_error(error or "backfill rejected")
-                row.lease_until = None
-                row.lease_token = None
-            runtime = db.get(RuntimeStateRow, 1)
-            if runtime is not None:
-                if counts["accepted"] or counts["duplicate"]:
-                    runtime.last_sync_at = now
-                if latest_error:
-                    runtime.last_error = _truncated_error(latest_error)
-                elif counts["accepted"] or counts["duplicate"]:
-                    runtime.last_error = None
-        return counts
 
     def backlog_counts(self) -> dict[str, int]:
         counts = {status.value: 0 for status in SyncStatus}
@@ -609,7 +399,7 @@ class EdgeRepository:
                     select(LocalScadaEventRow.id)
                     .where(
                         LocalScadaEventRow.sync_status == SyncStatus.SENT.value,
-                        LocalScadaEventRow.is_open.is_(False),
+                        LocalScadaEventRow.ended_at.is_not(None),
                         LocalScadaEventRow.synced_at < cutoff,
                     )
                     .order_by(LocalScadaEventRow.synced_at)

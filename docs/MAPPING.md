@@ -1,28 +1,39 @@
-# Mapeo local → central
+# Mapeo local a central
 
-El esquema se deriva de los modelos reales de `crystal-backend`. El backfill no llama a
-`/ingest/scada`: escribe únicamente histórico por el endpoint FastAPI
-`/ingest/offline/v1/backfill`.
+El backfill historico usa exclusivamente chunks CSV.gz mediante
+/offline-transfer. Nunca llama al endpoint realtime /ingest/scada y no existe
+un envio JSON de filas.
 
-| Local | Payload v1 | Central | Regla |
+## Minutos
+
+| CSV | Origen local | Destino central | Regla |
 |---|---|---|---|
-| `source_node_id` | `source_node_id` | `offline_collector_node.source_node_id` | Autenticación/autorización; no cambia la llave SCADA. |
-| `lagoon_id` | `lagoon_id` | `scada_minute.lagoon_id`, `scada_event.lagoon_id` | Debe coincidir con el nodo autorizado y una laguna habilitada. |
-| `local_scada_minute.id` | `minutes[].local_id` | no persistido | Identifica el acuse local; la idempotencia central usa la llave real. |
-| `tag_id` | `minutes[].tag_id` | `scada_minute.tag_id` | Debe existir en `collector_tag_registry`. Máximo 64 caracteres. |
-| `bucket` | `minutes[].bucket` | `scada_minute.bucket` | UTC, alineado al minuto. |
-| `state/value_num/value_bool` | igual | igual | Exactamente uno no nulo, según `value_codec` central. |
-| `quality` | `quality=good` | no existe | Calidad mala no se envía; la lectura inválida queda en logs locales. |
-| `(lagoon_id, tag_id, bucket)` | — | `uq_scada_minute` | Llave idempotente central, sin `source_node_id`. |
-| `local_scada_event.id` | `events[].local_id` | `scada_event.id` | UUID local preservado como llave idempotente. |
-| `started_at/ended_at` | igual | `start_ts/end_ts` | UTC; un reenvío solo puede cerrar un evento del mismo UUID. |
-| `is_open` | `events[].is_open` | derivado de `end_ts IS NULL` | Al recuperar conectividad, el segmento offline abierto se cierra en el límite de recuperación. |
-| `duration_sec` | igual | `scada_event.duration_sec` | Diferencia entera no negativa. |
+| lagoon_id | local_scada_minute.lagoon_id | scada_minute.lagoon_id | Debe pertenecer al nodo autenticado. |
+| tag_id | local_scada_minute.tag_id | scada_minute.tag_id | Tag registrado, maximo 64 caracteres. |
+| bucket | local_scada_minute.bucket | scada_minute.bucket | UTC y alineado al minuto. |
+| state | local_scada_minute.state | scada_minute.state | Uno de state/value_num/value_bool. |
+| value_num | local_scada_minute.value_num | scada_minute.value_num | Decimal con punto. |
+| value_bool | local_scada_minute.value_bool | scada_minute.value_bool | true/false. |
+| source | constante | scada_minute.source | Siempre collector_offline. |
 
-Los campos locales de lease, intentos, error y estado de sync nunca se envían. Un registro
-solo pasa a `sent` tras recibir `accepted` o `duplicate` para su `kind + local_id`.
+La idempotencia central de minutos es (lagoon_id, tag_id, bucket).
 
-## Efectos excluidos
+## Eventos
 
-El servicio `offline_backfill_service` no importa ni ejecuta el estado realtime, evaluación de
-alarmas, notificaciones, watchdog ni WebSocket. Los datos conservan sus timestamps históricos.
+| CSV | Origen local | Destino central | Regla |
+|---|---|---|---|
+| id | local_scada_event.id | scada_event.id | UUID idempotente preservado. |
+| lagoon_id/tag_id | columnas homonimas | columnas homonimas | Identidad funcional. |
+| tag_label | local_scada_event.tag_label | scada_event.tag_label | Puede ser vacio. |
+| alert_type | constante STATE_CHANGE | scada_event.alert_type | Historico, sin alarmas realtime. |
+| previous_state/state | columnas homonimas | columnas homonimas | Estado discreto. |
+| start_ts/end_ts | started_at/ended_at | start_ts/end_ts | UTC; evento se cierra al recuperar conectividad. |
+| duration_sec | diferencia entera | duration_sec | No negativa. |
+| source | constante | scada_event.source | Siempre collector_offline. |
+
+Los campos locales de lease, intentos, paths y estado no se incluyen en el
+CSV. Se transmiten en el manifiesto transfer_id, chunk_id, secuencia,
+data_kind, conteos, tamanos, SHA-256 y source=collector_offline.
+
+Las filas solo pasan a sent despues de VERIFIED. El importador historico no
+ejecuta alarmas, notificaciones, watchdog ni WebSocket.

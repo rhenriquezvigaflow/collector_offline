@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
 from uuid import UUID
+
+HISTORICAL_SOURCE = "collector_offline"
 
 
 class NodeState(StrEnum):
@@ -22,20 +23,61 @@ class SessionStatus(StrEnum):
 class SyncStatus(StrEnum):
     PENDING = "pending"
     SYNCING = "syncing"
+    CHUNKED = "chunked"
     SENT = "sent"
     FAILED = "failed"
 
 
-class DataQuality(StrEnum):
-    GOOD = "good"
-    BAD = "bad"
-    UNCERTAIN = "uncertain"
+class DataKind(StrEnum):
+    MINUTE = "minute"
+    EVENT = "event"
 
 
-class AckStatus(StrEnum):
-    ACCEPTED = "accepted"
-    DUPLICATE = "duplicate"
-    REJECTED = "rejected"
+class ChunkStatus(StrEnum):
+    CREATING = "CREATING"
+    SEALED = "SEALED"
+    PENDING = "PENDING"
+    UPLOADING = "UPLOADING"
+    UPLOADED = "UPLOADED"
+    IMPORTING = "IMPORTING"
+    VERIFIED = "VERIFIED"
+    FAILED = "FAILED"
+    QUARANTINED = "QUARANTINED"
+
+
+CHUNK_TRANSITIONS: dict[ChunkStatus, frozenset[ChunkStatus]] = {
+    ChunkStatus.CREATING: frozenset({ChunkStatus.SEALED, ChunkStatus.FAILED}),
+    ChunkStatus.SEALED: frozenset({ChunkStatus.PENDING, ChunkStatus.QUARANTINED}),
+    ChunkStatus.PENDING: frozenset({ChunkStatus.UPLOADING, ChunkStatus.QUARANTINED}),
+    ChunkStatus.UPLOADING: frozenset(
+        {
+            ChunkStatus.PENDING,
+            ChunkStatus.UPLOADED,
+            ChunkStatus.IMPORTING,
+            ChunkStatus.VERIFIED,
+            ChunkStatus.FAILED,
+            ChunkStatus.QUARANTINED,
+        }
+    ),
+    ChunkStatus.UPLOADED: frozenset(
+        {ChunkStatus.IMPORTING, ChunkStatus.VERIFIED, ChunkStatus.FAILED, ChunkStatus.QUARANTINED}
+    ),
+    ChunkStatus.IMPORTING: frozenset(
+        {ChunkStatus.VERIFIED, ChunkStatus.FAILED, ChunkStatus.QUARANTINED}
+    ),
+    ChunkStatus.VERIFIED: frozenset(),
+    ChunkStatus.FAILED: frozenset({ChunkStatus.PENDING, ChunkStatus.QUARANTINED}),
+    ChunkStatus.QUARANTINED: frozenset(),
+}
+
+
+def require_chunk_transition(before: ChunkStatus | str, after: ChunkStatus | str) -> None:
+    current = ChunkStatus(before)
+    target = ChunkStatus(after)
+    if target == current:
+        return
+    if target not in CHUNK_TRANSITIONS[current]:
+        raise ValueError(f"invalid chunk transition: {current.value} -> {target.value}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,29 +129,4 @@ class TagObservation:
     bucket: datetime
     captured_at: datetime
     value: StorageValue
-    quality: DataQuality = DataQuality.GOOD
 
-
-@dataclass(frozen=True, slots=True)
-class BackfillRecord:
-    kind: str
-    local_id: UUID
-    payload: dict[str, Any]
-    attempts: int
-    lease_token: UUID
-
-
-@dataclass(frozen=True, slots=True)
-class BackfillAck:
-    kind: str
-    local_id: UUID
-    status: AckStatus
-    retryable: bool = False
-    code: str | None = None
-    detail: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class BackfillResponse:
-    acknowledgements: list[BackfillAck] = field(default_factory=list)
-    correlation_id: str | None = None

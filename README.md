@@ -1,284 +1,191 @@
 # Collector Offline
 
-Nodo local de contingencia SCADA para Crystal Lagoons, ejecutado en Ubuntu Server 24.04.
-El Collector Central sigue siendo la fuente oficial: mientras el backend está `ONLINE`, este
-servicio no lee PLCs. Tras tres fallos consecutivos del readiness central abre una sesión,
-captura localmente por minuto y, al recuperar conexión, detiene primero la captura y envía el
-histórico por un endpoint FastAPI sin efectos realtime.
+Nodo local de contingencia SCADA para Ubuntu Server 24.04. El Collector Central
+sigue siendo la fuente principal: este servicio solo lee PLC durante OFFLINE,
+conserva lecturas en PostgreSQL local y transfiere el historico como chunks
+CSV.gz reanudables cuando entra en SYNCING.
 
-La configuración incluida está preparada para `small_sim` y utiliza una copia local
-autosuficiente: [`config/small_sim.yml`](config/small_sim.yml). No referencia archivos del
-Collector Central durante la desconexión.
+La captura PLC, drivers Rockwell/Siemens, transformacion, escritura local y
+frecuencia de 60 segundos no cambian. El backfill JSON fue retirado.
 
 ## Arquitectura
 
-```mermaid
+~~~mermaid
 flowchart LR
-    PLC[PLC Siemens / Rockwell] -->|solo OFFLINE| LC[Collector Local]
-    LC --> LDB[(PostgreSQL crystal_offline)]
-    SUP[Supervisor + máquina persistente] --> LC
-    SUP -->|readiness HTTP| API[Backend FastAPI central]
-    LDB --> SW[Sync Worker con lease]
-    SUP --> SW
-    SW -->|POST backfill v1 HTTPS| API
-    API --> CDB[(scada_minute / scada_event)]
-    API -. no WS / alarmas / notificaciones .-> CDB
-    FAST[FastAPI local :9187] --> LDB
-```
+    PLC[PLC Siemens / Rockwell] -->|cada 60 s, solo OFFLINE| CAP[Captura local]
+    CAP --> LDB[(PostgreSQL crystal_offline)]
+    LDB --> BUILD[Chunk Builder]
+    BUILD --> OUT[/var/lib/crystal-offline/outbox]
+    OUT -->|partes HTTPS reanudables| API[API central /offline-transfer]
+    API --> WORK[Validacion e import worker]
+    WORK --> CDB[(scada_minute / scada_event)]
+    API -->|VERIFIED| OUT
+    SUP[Supervisor ONLINE/OFFLINE/SYNCING] --> CAP
+~~~
 
-El proceso es único y las transiciones se centralizan en `StateCoordinator`. Una conexión
-PostgreSQL mantiene un advisory lock durante toda la vida del proceso. Los registros reclamados
-para sync tienen además lease y `FOR UPDATE SKIP LOCKED`, por lo que un crash los devuelve a
-`pending` al expirar.
+El builder y uploader viven en un thread separado. Gzip, fsync y HTTP nunca
+bloquean el loop de captura. Hay un chunk y una parte activos. PostgreSQL
+mantiene locks, leases, asociacion fila/chunk y progreso confirmado.
 
-```mermaid
-stateDiagram-v2
-    [*] --> ONLINE
-    ONLINE --> ONLINE: health OK o < 3 fallos
-    ONLINE --> OFFLINE: umbral de fallos
-    OFFLINE --> OFFLINE: central caído / captura local
-    OFFLINE --> SYNCING: umbral de recuperación\nse detiene captura primero
-    SYNCING --> ONLINE: backlog completo y confirmado
-    SYNCING --> OFFLINE: nueva caída\nse conserva backlog
-```
+~~~text
+CREATING -> SEALED -> PENDING -> UPLOADING
+UPLOADING -> PENDING | UPLOADED | IMPORTING | VERIFIED | QUARANTINED
+UPLOADED -> IMPORTING | VERIFIED | QUARANTINED
+IMPORTING -> VERIFIED | QUARANTINED
+~~~
 
-## Configuración actual: `small_sim`
+Un FAILED del import central vuelve a ejecutar complete con backoff; no se pierde
+el chunk. Solo VERIFIED marca filas sent. Los archivos VERIFIED se retienen siete
+dias y su metadata, noventa dias por defecto.
 
-[`config/collector-offline.yml`](config/collector-offline.yml) contiene:
+## Source obligatorio
 
-```yaml
-node:
-  source_node_id: "edge-small-sim-01"
-  lagoon_id: "small_sim"
-  product_type: "small"
+Cada fila local, CSV, manifiesto e import central usa exactamente:
 
-plcs:
-  - include: "small_sim.yml"
-```
+~~~text
+source = collector_offline
+~~~
 
-La copia local actual selecciona Rockwell en `192.168.100.11` y lee los tags `motor` y
-`partir`. El campo `backend` presente en la copia se ignora deliberadamente; el offline nunca
-llama al endpoint realtime.
+source_node_id y lagoon_id son campos separados y nunca sustituyen source.
 
-El backend central se consulta cada 60 segundos en `192.168.2.100`. Como actualmente solo
-ofrece HTTP en la red privada de planta, el YAML habilita explícitamente
-`central.allow_private_http: true`; HTTP público continúa rechazado.
+## Configuracion de sitio
 
-Para otra laguna:
+El repositorio no incluye un config/site.yml de produccion. Para una
+instalacion nueva se entrega explicitamente el YAML aprobado con --site. El
+instalador lo copia a /etc/crystal/collector-offline/site.yml y nunca lo
+sobrescribe durante upgrades.
 
-1. Copiar su YAML oficial a `/etc/crystal/collector-offline/<laguna>.yml`.
-2. Cambiar solo `node.source_node_id`, `node.lagoon_id`, `node.product_type` y
-   `plcs[0].include` en `collector-offline.yml`.
-3. Registrar ese `source_node_id`, laguna y hash de token en el backend central.
-4. Reiniciar y comprobar `/health/ready`.
+El mismo YAML de PLC/tags existente sigue siendo valido; agregue solo el bloque
+offline:
 
-Drivers, tags, tipos automáticos, tablas, migraciones, captura y sync se resuelven desde esos
-YAML. Se soportan las fuentes existentes: `siemens`, `rockwell` y `simulator`. Un tag escalar
-mantiene compatibilidad con el Collector Central; opcionalmente se puede enriquecer localmente:
-
-```yaml
-tags:
-  P001_ST:
-    address: "P001_ST"
-    data_type: state
-    event: true
-    label: "Bomba de recirculación"
-```
-
-Sin `event`, el modo automático replica las reglas centrales para booleanos, estados `0..3` y
-sufijos `.ST`, `_ST`, `_STS`, `_ST_SCADA`, `_STS_SCADA`.
-
-### Selección Siemens o Rockwell desde YAML
-
-El selector es `source`, igual que en el Collector Central. No hay que cambiar código Python.
-Para Siemens:
-
-```yaml
-source: siemens
-siemens:
-  opc_server_url: "opc.tcp://192.168.17.10:4840"
-  timeout_sec: 5
-tags:
-  PT117_R_SCADA: "ns=4;i=3"
-```
-
-Para Rockwell:
-
-```yaml
+~~~yaml
+lagoon_id: "laguna_norte"
+product_type: "crystal"
 source: rockwell
-force_reconnect_every_sec: 3600
-max_consecutive_fails: 10
 rockwell:
-  ip: "192.168.26.10"
+  ip: "192.168.20.10"
   slot: 0
-  timeout_sec: 5
 tags:
-  PT203_R: "PT203_R"
-  P300_ST: "P300_ST"
-```
+  Motor: "Motor"
 
-Rockwell mantiene una conexión persistente, lee los tags en batch y rota la sesión con los
-mismos parámetros del Collector Central. La plantilla lista para copiar está en
-[`config/rockwell-example.yml`](config/rockwell-example.yml). Al desplegar, el instalador copia
-todos los YAML locales nuevos sin sobrescribir los que ya fueron configurados en la VM.
+offline:
+  central:
+    base_url: "https://backend-central.example.com/api"
+~~~
 
-## Base de datos separada
+base_url deriva:
 
-El nodo usa exclusivamente `crystal_offline`; nunca escribe directamente en `crystal_plc`.
-En Ubuntu, el script crea el usuario de sistema/rol PostgreSQL `collector_local`, la base
-`crystal_offline` y autenticación peer por socket local:
+- https://backend-central.example.com/api/health/ready
+- https://backend-central.example.com/api/offline-transfer
 
-```bash
-sudo bash scripts/provision-postgres.sh
-export COLLECTOR_OFFLINE_DATABASE_URL='postgresql+psycopg2:///crystal_offline'
-collector-offline migrate --config config/collector-offline.yml
-```
+HTTP privado solo se admite como excepcion explicita de transicion mediante
+allow_private_http: true. Produccion debe usar HTTPS y validacion TLS.
 
-La migración versionada está en
-[`migrations/local/001_initial.sql`](migrations/local/001_initial.sql). Contiene constraints,
-índices de pendientes/sesiones/tags, timestamps `timestamptz`, unicidad por bucket y la fila
-persistente de estado.
+El formato legacy config/collector-offline.yml sigue siendo legible. Debe usar
+central.transfer_url; sync_url solo se acepta para derivar la URL nueva durante
+una actualizacion y nunca recibe datos.
 
-Para enviar solamente la migración y ejecutarla por SSH desde Windows:
+Los limites edge estan alineados con el central: 20.000 filas, 25 MiB sin
+comprimir y partes de hasta 2 MiB. Defaults:
 
-```powershell
-.\scripts\deploy-schema-ssh.ps1 -Server 192.168.100.20
-```
+~~~yaml
+chunk:
+  outbox_path: "/var/lib/crystal-offline/outbox"
+  max_rows: 20000
+  max_uncompressed_size_mb: 25
+  max_age_minutes: 360
+  claim_timeout_seconds: 900
+transfer:
+  part_size_kb: 1024
+  max_parallel_uploads: 1
+  connect_timeout_seconds: 10
+  request_timeout_seconds: 60
+  retry_initial_seconds: 15
+  retry_max_seconds: 300
+retention:
+  verified_files_days: 7
+  verified_metadata_days: 90
+~~~
 
-El destino puede usar el usuario definido en `~/.ssh/config`; también puede indicarse
-explícitamente con `-User`. El script copia
-[`scripts/apply-initial-schema.sh`](scripts/apply-initial-schema.sh) y `001_initial.sql`,
-verifica ambos hashes SHA-256 y crea idempotentemente la base, el rol y las tablas. Use
-`-UploadOnly` si solo desea transferir los archivos sin modificar PostgreSQL. Si el servidor
-requiere contraseña de SSH o `sudo`, ejecútelo desde una terminal con `-Interactive`; la
-contraseña no se almacena:
+## Instalacion
 
-```powershell
-.\scripts\deploy-schema-ssh.ps1 -Server 192.168.100.20 -Interactive
-```
+Fresh install:
 
-## Instalación en Ubuntu 24.04
-
-```bash
-sudo bash scripts/install.sh
+~~~bash
+sudo bash scripts/install.sh --site /ruta/al/site.yml
 sudoedit /etc/crystal/collector-offline.env
-sudoedit /etc/crystal/collector-offline/collector-offline.yml
 sudo systemctl start collector-offline
-sudo systemctl status collector-offline
-```
+sudo systemctl status collector-offline --no-pager
+~~~
 
-Antes de iniciar, aplique en el backend central:
+Upgrade con site.yml ya instalado:
 
-```bash
-psql "$CENTRAL_DATABASE_URL" -f crystal-backend/scripts/create_offline_backfill.sql
-TOKEN="$(openssl rand -hex 32)"
-TOKEN_HASH="$(printf %s "$TOKEN" | sha256sum | awk '{print $1}')"
-```
+~~~bash
+sudo bash scripts/install.sh
+~~~
 
-Inserte `edge-small-sim-01`, `small_sim` y `$TOKEN_HASH` en
-`offline_collector_node`; guarde el token plano únicamente como
-`COLLECTOR_OFFLINE_TOKEN` en `/etc/crystal/collector-offline.env` con permisos `0600`.
-El endpoint central es `POST /ingest/offline/v1/backfill` y autentica
-`Authorization: Bearer` por nodo y laguna.
+El instalador detiene un servicio activo antes de copiar y migrar, conserva el
+YAML, crea el StateDirectory/outbox con owner collector_local y reinicia si el
+servicio estaba activo.
 
-El servicio systemd reinicia automáticamente, maneja `SIGTERM/SIGINT`, no tiene privilegios y
-restringe filesystem/capabilities. Los logs JSON salen a journald, que administra rotación:
+En el backend central:
 
-```bash
-journalctl -u collector-offline -f -o cat
-journalctl --disk-usage
-```
+~~~bash
+psql "$CENTRAL_DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f scripts/create_offline_transfer.sql
+~~~
 
-Configure en `journald.conf` límites corporativos (`SystemMaxUse` y `MaxRetentionSec`) si los
-defaults del servidor no cumplen la política de retención.
+Registre source_node_id, lagoon_id y el hash SHA-256 del token en
+offline_collector_node. El token plano solo vive en
+/etc/crystal/collector-offline.env, modo 0600.
 
-## Estado operativo FastAPI
+## API central
 
-La API local solo escucha loopback:
+~~~text
+POST /offline-transfer/transfers
+GET  /offline-transfer/transfers/{transfer_id}
+PUT  /offline-transfer/transfers/{transfer_id}/parts/{part_number}
+POST /offline-transfer/transfers/{transfer_id}/complete
+~~~
 
-- `GET http://127.0.0.1:9187/health/live`
-- `GET http://127.0.0.1:9187/health/ready`
-- `GET http://127.0.0.1:9187/status`
+Todas usan Bearer token. Las partes son application/octet-stream con
+Content-Length, SHA-256 y offset opcional. Crear/repetir transferencias y partes identicas es
+idempotente.
 
-`/status` entrega estado, última comprobación central, sesión activa, backlog por estado, última
-sincronización y último error. También está disponible por CLI:
+## Operacion
 
-```bash
-collector-offline status --config /etc/crystal/collector-offline/collector-offline.yml
-bash scripts/smoke-test.sh
-```
+~~~bash
+curl -s http://127.0.0.1:9187/health/live
+curl -s http://127.0.0.1:9187/status
+sudo -u collector_local -H /opt/crystal/collector-offline/.venv/bin/collector-offline \
+  status --config /etc/crystal/collector-offline/site.yml
+sudo journalctl -u collector-offline -f -o cat
+~~~
 
-## Seguridad y red
+El status incluye backlog de filas, chunks por estado y oldest_pending_at. Los
+logs incluyen creacion/compresion, partes, bytes, velocidad, reintentos,
+progreso central, VERIFIED y cuarentena, sin tokens ni payloads completos.
 
-- PostgreSQL escucha solo socket local o loopback; no publicar 5432.
-- Permitir desde el nodo únicamente salida al PLC configurado y TCP 443 al backend central.
-- No abrir 9187: la API FastAPI local está fijada a loopback por validación.
-- TLS y certificados son obligatorios para URLs no loopback. Se admite una CA corporativa en
-  `central.ca_bundle`; `verify_tls: false` se rechaza.
-- No registrar tokens ni payloads completos. Los logs incluyen componente, nodo, estado,
-  sesión y correlation ID cuando corresponde.
-- Mantener YAML en `0640` y el archivo de entorno en `0600`.
+La estructura del outbox es:
 
-Ejemplo UFW, ajustando IP/puerto OPC UA reales:
+~~~text
+creating/ pending/ uploading/ verified/ failed/ quarantine/
+~~~
 
-```bash
-sudo ufw default deny incoming
-sudo ufw allow OpenSSH
-sudo ufw default deny outgoing
-sudo ufw allow out to 192.168.100.10 port 4840 proto tcp
-sudo ufw allow out 443/tcp
-```
+## Desarrollo
 
-No aplique esas reglas sin confirmar DNS/NTP/repositorios y la red de administración del sitio.
-
-## Sincronización e idempotencia
-
-- Transporte al menos una vez; `sent` solo tras `accepted` o `duplicate` explícito.
-- Minutos: idempotencia central `(lagoon_id, tag_id, bucket)`.
-- Eventos: UUID local preservado; un reenvío solo puede completar `end_ts`.
-- `429`, `5xx`, red y timeouts son reintentables con backoff exponencial y jitter.
-- `401/403/4xx` de contrato y rechazos permanentes quedan `failed` para intervención.
-- Si el proceso muere, leases vencidos vuelven a `pending` al arrancar.
-- Un registro `failed` impide cerrar la sesión y nunca se elimina por retención.
-
-El detalle campo a campo está en [`docs/MAPPING.md`](docs/MAPPING.md).
-
-## Desarrollo y pruebas
-
-```bash
+~~~bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[plc,dev]'
 pytest -q
-ruff check .
-mypy src
-```
+ruff check src tests
+mypy src/collector_offline
+~~~
 
-Para la integración PostgreSQL real use una base desechable ya creada:
+Documentacion:
 
-```bash
-TEST_DATABASE_URL='postgresql+psycopg2:///crystal_offline_test' pytest -m postgres -q
-```
-
-La suite simulada cubre estabilidad ONLINE, umbral de tres fallos, buckets sin duplicados,
-eventos, recuperación, sync parcial, reinicios OFFLINE/SYNCING, leases, nueva caída, errores
-permanentes/reintentables, retención, doble claim y UTC.
-
-## Troubleshooting
-
-- `another Collector Offline instance...`: ya existe un proceso con advisory lock; revisar
-  `systemctl status` antes de iniciar otro.
-- Backlog `failed`: consultar `last_sync_error`, corregir token/tag/contrato y ejecutar
-  `collector-offline retry-failed --config /etc/crystal/collector-offline/collector-offline.yml`.
-  No se borra ni reencola solo.
-- `central readiness ... degraded`: `/health/ready` central no puede usar PostgreSQL; el nodo no
-  vuelve a ONLINE solo por recibir ping.
-- Sin lecturas OPC UA: validar IP, puerto 4840, namespace IDs de la copia local y paquete
-  opcional `plc`.
-- Cambio de tags: actualizar primero el YAML central, confirmar registro realtime y copiar la
-  versión aprobada al archivo local antes de reiniciar.
-
-Decisiones y riesgos pendientes: [`docs/DECISIONS.md`](docs/DECISIONS.md).
-
-Guía completa de despliegue en VM Linux:
-[`docs/MIGRACION_VM_UBUNTU.md`](docs/MIGRACION_VM_UBUNTU.md).
+- docs/OFFLINE_TRANSFER.md: contrato, estados, recovery, instalacion y rollback.
+- docs/MAPPING.md: columnas CSV hacia scada_minute/scada_event.
+- docs/MIGRACION_VM_UBUNTU.md: despliegue, backup y recuperacion.
+- docs/REUTILIZACION_NUEVA_LAGUNA.md: reutilizacion del YAML PLC existente.

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Ubuntu 24.04: crea una base/rol propios. La aplicación usa autenticación peer
-# por socket local bajo el usuario systemd "collector_local"; no hay contraseña.
+# Base separada para el buffer offline. La aplicación usa autenticación peer
+# por socket local con el usuario Linux/PostgreSQL collector_local.
 DB_NAME="crystal_offline"
 DB_ROLE="collector_local"
 
@@ -32,4 +32,4 @@ SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'db_name', :'db_role')
 \gexec
 SQL
 
-echo "PostgreSQL database ${DB_NAME} is ready for OS/database role ${DB_ROLE}."
+echo "PostgreSQL listo: database=${DB_NAME}, role=${DB_ROLE}."

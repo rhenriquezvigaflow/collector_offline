@@ -56,7 +56,6 @@ if (-not $Interactive) {
     $sshArgs += @('-o', 'BatchMode=yes')
     $scpArgs += @('-o', 'BatchMode=yes')
 }
-
 if ($IdentityFile) {
     $resolvedIdentity = (Resolve-Path -LiteralPath $IdentityFile).Path
     $sshArgs += @('-i', $resolvedIdentity)
@@ -97,11 +96,16 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $localHashes = @{
-    'apply-initial-schema.sh' = (Get-FileHash -Algorithm SHA256 -LiteralPath $runnerPath).Hash.ToLowerInvariant()
-    '001_initial.sql' = (Get-FileHash -Algorithm SHA256 -LiteralPath $sqlPath).Hash.ToLowerInvariant()
+    'apply-initial-schema.sh' = (
+        Get-FileHash -Algorithm SHA256 -LiteralPath $runnerPath
+    ).Hash.ToLowerInvariant()
+    '001_initial.sql' = (
+        Get-FileHash -Algorithm SHA256 -LiteralPath $sqlPath
+    ).Hash.ToLowerInvariant()
 }
 foreach ($fileName in $localHashes.Keys) {
-    $matchingLine = $remoteHashes | Where-Object { $_ -match "/$([regex]::Escape($fileName))$" }
+    $matchingLine = $remoteHashes |
+        Where-Object { $_ -match "/$([regex]::Escape($fileName))$" }
     if (-not $matchingLine) {
         throw "El servidor no devolvió el hash de $fileName."
     }
@@ -114,7 +118,10 @@ foreach ($fileName in $localHashes.Keys) {
 Write-Host "Archivos transferidos y verificados en $remoteDir."
 if ($UploadOnly) {
     Write-Host 'UploadOnly activo; no se modificó PostgreSQL.'
-    Write-Host "Para ejecutar: sudo bash $remoteDir/apply-initial-schema.sh --sql $remoteDir/001_initial.sql"
+    Write-Host (
+        "Para ejecutar: sudo bash $remoteDir/apply-initial-schema.sh " +
+        "--sql $remoteDir/001_initial.sql"
+    )
     exit 0
 }
 
@@ -134,7 +141,7 @@ if ($Interactive) {
 if ($LASTEXITCODE -ne 0) {
     throw @"
 La ejecución remota falló. Los archivos permanecen en $remoteDir.
-Si el servidor exige contraseña sudo, entre por SSH y ejecute:
+Ejecute manualmente:
   sudo bash $remoteDir/apply-initial-schema.sh --database $Database --role $DatabaseRole --sql $remoteDir/001_initial.sql
 "@
 }

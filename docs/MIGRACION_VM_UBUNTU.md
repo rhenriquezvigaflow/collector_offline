@@ -1,5 +1,11 @@
 # Migración de Collector Offline a una VM Ubuntu 24.04
 
+> Para despliegues nuevos use un único
+> [`config/site.yml`](../config/site.yml) y la guía
+> [`REUTILIZACION_NUEVA_LAGUNA.md`](REUTILIZACION_NUEVA_LAGUNA.md). Las referencias posteriores
+> a `collector-offline.yml` y `small_sim.yml` describen el formato antiguo, que continúa
+> soportado únicamente para no romper servidores ya instalados.
+
 Esta guía instala el Collector Offline en una VM Linux ubicada en la planta. La VM mantendrá
 una copia local de la configuración de la laguna y una base PostgreSQL independiente llamada
 `crystal_offline`, propiedad del usuario/rol local `collector_local`.
@@ -168,14 +174,14 @@ node:
 
 central:
   health_url: "https://backend-central.example.com/api/health/ready"
-  sync_url: "https://backend-central.example.com/api/ingest/offline/v1/backfill"
+  transfer_url: "https://backend-central.example.com/api/offline-transfer"
   verify_tls: true
 
 plcs:
   - include: "small_sim.yml"
 ```
 
-No configure `/ingest/scada` como `sync_url`; ese endpoint pertenece al flujo realtime.
+No configure /ingest/scada como transfer_url; ese endpoint pertenece al flujo realtime.
 
 ## 6. Preparar el backend central
 
@@ -187,7 +193,7 @@ Desde el repositorio `crystal-backend` del servidor central:
 ```bash
 psql "$CENTRAL_DATABASE_URL" \
   -v ON_ERROR_STOP=1 \
-  -f scripts/create_offline_backfill.sql
+  -f scripts/create_offline_transfer.sql
 ```
 
 Genere un token distinto para el nodo:
@@ -234,7 +240,7 @@ lo agregue a Git.
 Desde `/tmp/collector-offline-install`:
 
 ```bash
-sudo bash scripts/install.sh
+sudo bash scripts/install.sh --site /ruta/al/site.yml
 ```
 
 El instalador realiza las siguientes operaciones:
@@ -242,12 +248,12 @@ El instalador realiza las siguientes operaciones:
 1. Instala Python, PostgreSQL local, certificados y herramientas requeridas.
 2. Crea el usuario de sistema sin privilegios `collector_local`.
 3. Copia la aplicación a `/opt/crystal/collector-offline`.
-4. Copia todos los YAML locales nuevos a `/etc/crystal/collector-offline`, sin sobrescribir los
-   que ya estén configurados en la VM.
+4. Instala el YAML indicado solo si el sitio aun no existe; en upgrades conserva
+   /etc/crystal/collector-offline/site.yml.
 5. Crea el rol `collector_local` y la base PostgreSQL independiente `crystal_offline`.
 6. Crea el entorno virtual e instala drivers Siemens/Rockwell.
 7. Aplica las migraciones locales.
-8. Instala y habilita el servicio systemd, pero no lo inicia.
+8. Instala y habilita systemd; si el servicio estaba activo, lo reinicia y verifica.
 
 Compruebe la base separada:
 
@@ -364,8 +370,9 @@ desde la VM.
    ```
 
 2. Interrumpa de forma controlada la ruta al backend central.
-3. Después de uno y dos health checks fallidos, el estado debe continuar `online`.
-4. Al tercer fallo consecutivo debe cambiar a `offline` y crear una única sesión.
+3. Después de los fallos en `t=0` y `t=30 s`, el estado debe continuar `online`.
+4. Al tercer fallo en `t=60 s` debe cambiar a `offline`, crear una única sesión e insertar
+   inmediatamente la primera captura.
 5. Espere al menos dos minutos y compruebe captura:
 
    ```bash
@@ -409,12 +416,20 @@ Antes de instalar una nueva versión:
 
 ```bash
 sudo systemctl stop collector-offline
-sudo pg_dump -Fc crystal_offline \
-  -f /var/backups/crystal_offline-"$(date +%F-%H%M)".dump
+sudo install -d -m 0700 -o postgres -g postgres /var/backups/crystal-offline
+sudo -u postgres pg_dump -Fc crystal_offline \
+  -f /var/backups/crystal-offline/crystal_offline-"$(date +%F-%H%M)".dump
 sudo cp -a /etc/crystal/collector-offline \
   /var/backups/collector-offline-config-"$(date +%F-%H%M)"
 sudo cp -a /etc/crystal/collector-offline.env \
   /var/backups/collector-offline.env-"$(date +%F-%H%M)"
+sudo cp -a /opt/crystal/collector-offline \
+  /var/backups/collector-offline-app-"$(date +%F-%H%M)"
+sudo cp -a /etc/systemd/system/collector-offline.service \
+  /var/backups/collector-offline.service-"$(date +%F-%H%M)"
+sudo tar --acls --xattrs -C /var/lib -czf \
+  /var/backups/collector-offline-outbox-"$(date +%F-%H%M)".tar.gz \
+  crystal-offline
 ```
 
 Transfiera y extraiga la nueva versión, ejecute nuevamente `scripts/install.sh`, revise los YAML
@@ -444,8 +459,56 @@ Para restaurar una versión anterior:
 
 1. Restaure `/opt/crystal/collector-offline` desde el paquete anterior.
 2. Restaure los YAML y el archivo de entorno desde `/var/backups`.
-3. No restaure la base si contiene backlog `pending`, `syncing` o `failed` más reciente.
-4. Ejecute migraciones y vuelva a iniciar systemd.
+3. Restaure tambien la unit y el outbox del mismo punto de backup si corresponde.
+4. No restaure la base si contiene backlog pending, syncing, chunked, uploading o
+   failed mas reciente.
+5. Ejecute migraciones y vuelva a iniciar systemd.
+
+Una version anterior sin soporte de chunks no puede procesar filas chunked. Antes de ese
+downgrade, detenga el import central y libere en una transaccion solo filas de chunks no
+VERIFIED a pending, limpiando chunk_id y leases; marque esos chunks QUARANTINED y conserve
+los archivos. Nunca reencole ni modifique filas VERIFIED. La opcion preferida es restaurar
+una version compatible con chunks.
+
+Solo para ese downgrade coordinado, con collector e import central detenidos:
+
+~~~sql
+BEGIN;
+CREATE TEMP TABLE rollback_nonverified_chunks AS
+SELECT chunk_id
+FROM transfer_chunk
+WHERE status <> 'VERIFIED';
+
+UPDATE local_scada_minute
+SET sync_status = 'pending',
+    chunk_id = NULL,
+    lease_until = NULL,
+    lease_token = NULL,
+    next_retry_at = NULL
+WHERE chunk_id IN (SELECT chunk_id FROM rollback_nonverified_chunks)
+  AND sync_status IN ('syncing', 'chunked');
+
+UPDATE local_scada_event
+SET sync_status = 'pending',
+    chunk_id = NULL,
+    lease_until = NULL,
+    lease_token = NULL,
+    next_retry_at = NULL
+WHERE chunk_id IN (SELECT chunk_id FROM rollback_nonverified_chunks)
+  AND sync_status IN ('syncing', 'chunked');
+
+UPDATE transfer_chunk
+SET status = 'QUARANTINED',
+    lease_until = NULL,
+    lease_token = NULL,
+    next_retry_at = NULL,
+    last_error = 'manual rollback to pre-chunk collector'
+WHERE chunk_id IN (SELECT chunk_id FROM rollback_nonverified_chunks);
+COMMIT;
+~~~
+
+Verifique los conteos y conserve el backup/outbox. No ejecute este SQL si algun job central
+sigue importando.
 
 No elimine manualmente backlog pendiente para resolver un problema de despliegue.
 

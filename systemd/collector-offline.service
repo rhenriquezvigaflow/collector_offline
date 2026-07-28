@@ -10,12 +10,15 @@ User=collector_local
 Group=collector_local
 WorkingDirectory=/opt/crystal/collector-offline
 EnvironmentFile=/etc/crystal/collector-offline.env
-ExecStart=/opt/crystal/collector-offline/.venv/bin/collector-offline run --config /etc/crystal/collector-offline/collector-offline.yml
+ExecStart=/opt/crystal/collector-offline/.venv/bin/collector-offline run --config /etc/crystal/collector-offline/site.yml
 Restart=always
 RestartSec=5
-TimeoutStopSec=30
+TimeoutStopSec=90
 KillSignal=SIGTERM
 UMask=0077
+StateDirectory=crystal-offline
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/crystal-offline
 
 NoNewPrivileges=true
 PrivateTmp=true
@@ -30,7 +33,7 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
-# Logs JSON por stdout/stderr; journald aplica rotación y retención.
+# Logs JSON por stdout/stderr; journald administra rotación y retención.
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=collector-offline

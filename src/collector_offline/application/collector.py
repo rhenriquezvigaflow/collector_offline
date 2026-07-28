@@ -5,12 +5,11 @@ import math
 from datetime import datetime
 from typing import Any
 
-from collector_offline.domain.models import DataQuality, NodeState, StorageValue, TagObservation
+from collector_offline.domain.models import NodeState, StorageValue, TagObservation
 from collector_offline.domain.time import ensure_utc, minute_bucket
 from collector_offline.domain.value_codec import (
     coerce_state_value,
     discrete_value,
-    is_discrete,
     to_storage_value,
 )
 from collector_offline.infrastructure.drivers import BoundReader
@@ -80,11 +79,8 @@ class LocalCollector:
                     bucket=bucket,
                     captured_at=captured_at,
                     value=normalized,
-                    quality=DataQuality.GOOD,
                 )
-                event_enabled = spec.event is True or (
-                    spec.event is None and is_discrete(raw_value, tag_id)
-                )
+                event_enabled = spec.event is True
                 if event_enabled:
                     state = discrete_value(raw_value, tag_id)
                     if state is not None:

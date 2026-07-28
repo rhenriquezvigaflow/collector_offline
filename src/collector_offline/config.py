@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from contextlib import suppress
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -151,18 +152,22 @@ class CentralConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     health_url: str
-    sync_url: str
+    # Legacy-only fallback used to derive the transfer origin during upgrades.
+    sync_url: str | None = None
+    transfer_url: str | None = None
     token_env: str = "COLLECTOR_OFFLINE_TOKEN"
     timeout_sec: float = Field(default=10.0, gt=0, le=120)
     verify_tls: bool = True
     ca_bundle: str | None = None
     allow_private_http: bool = False
-    health_attempts: int = Field(default=2, ge=1, le=10)
+    health_attempts: int = Field(default=1, ge=1, le=10)
     health_backoff_base_sec: float = Field(default=0.5, ge=0, le=30)
 
-    @field_validator("health_url", "sync_url")
+    @field_validator("health_url", "sync_url", "transfer_url")
     @classmethod
-    def normalize_url(cls, value: str) -> str:
+    def normalize_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         normalized = value.strip()
         if not normalized:
             raise ValueError("central URL cannot be empty")
@@ -172,7 +177,11 @@ class CentralConfig(BaseModel):
     def validate_tls(self) -> CentralConfig:
         if self.verify_tls is False:
             raise ValueError("verify_tls=false is not allowed")
-        for value in (self.health_url, self.sync_url):
+        if not self.transfer_url and not self.sync_url:
+            raise ValueError("central.transfer_url is required")
+        for value in (self.health_url, self.transfer_url or self.sync_url):
+            if value is None:
+                continue
             parsed = urlsplit(value)
             hostname = parsed.hostname or ""
             is_loopback = hostname in {"localhost", "127.0.0.1", "::1"}
@@ -190,11 +199,29 @@ class CentralConfig(BaseModel):
             )
         return self
 
+    @property
+    def offline_transfer_url(self) -> str:
+        if self.transfer_url:
+            return self.transfer_url.rstrip("/")
+        if not self.sync_url:
+            raise ValueError("central.transfer_url is required")
+        parsed = urlsplit(self.sync_url)
+        legacy_suffix = "/ingest/offline/v1/backfill"
+        legacy_path = parsed.path.rstrip("/")
+        prefix = (
+            legacy_path[: -len(legacy_suffix)]
+            if legacy_path.endswith(legacy_suffix)
+            else ""
+        )
+        return urlunsplit(
+            (parsed.scheme, parsed.netloc, f"{prefix}/offline-transfer", "", "")
+        )
+
 
 class SupervisorConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    health_interval_sec: float = Field(default=60, ge=1)
+    health_interval_sec: float = Field(default=30, ge=1)
     failure_threshold: int = Field(default=3, ge=1)
     recovery_threshold: int = Field(default=2, ge=1)
     syncing_failure_threshold: int = Field(default=1, ge=1)
@@ -215,14 +242,53 @@ class CaptureConfig(BaseModel):
 
 
 class SyncConfig(BaseModel):
+    """Accepted only so existing site YAML remains backward compatible."""
+
     model_config = ConfigDict(extra="forbid")
 
-    batch_size: int = Field(default=250, ge=1, le=5000)
+    batch_size: int = Field(default=25, ge=1, le=5000)
     lease_sec: int = Field(default=120, ge=10)
     max_attempts: int = Field(default=10, ge=1)
     backoff_base_sec: float = Field(default=2, ge=0.1)
     backoff_max_sec: float = Field(default=300, ge=1)
     idle_interval_sec: float = Field(default=2, ge=0.1, le=60)
+
+
+class ChunkConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    outbox_path: Path = Path("/var/lib/crystal-offline/outbox")
+    max_rows: int = Field(default=20_000, ge=1, le=20_000)
+    max_uncompressed_size_mb: float = Field(default=25, gt=0, le=25)
+    max_age_minutes: int = Field(default=360, ge=1)
+    claim_timeout_seconds: int = Field(default=900, ge=30)
+
+    @property
+    def max_uncompressed_size_bytes(self) -> int:
+        return int(self.max_uncompressed_size_mb * 1024 * 1024)
+
+
+class TransferConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    part_size_kb: int = Field(default=1024, ge=64, le=2048)
+    max_parallel_uploads: Literal[1] = 1
+    connect_timeout_seconds: float = Field(default=10, gt=0, le=120)
+    request_timeout_seconds: float = Field(default=60, gt=0, le=600)
+    retry_initial_seconds: float = Field(default=15, gt=0)
+    retry_max_seconds: float = Field(default=300, gt=0)
+    poll_interval_seconds: float = Field(default=5, ge=0.1, le=300)
+    lease_seconds: int = Field(default=180, ge=30)
+
+    @model_validator(mode="after")
+    def validate_retry_window(self) -> TransferConfig:
+        if self.retry_max_seconds < self.retry_initial_seconds:
+            raise ValueError("retry_max_seconds must be >= retry_initial_seconds")
+        return self
+
+    @property
+    def part_size_bytes(self) -> int:
+        return self.part_size_kb * 1024
 
 
 class RetentionConfig(BaseModel):
@@ -232,6 +298,8 @@ class RetentionConfig(BaseModel):
     days: int = Field(default=90, ge=1)
     batch_size: int = Field(default=1000, ge=1, le=10000)
     interval_sec: int = Field(default=3600, ge=60)
+    verified_files_days: int = Field(default=7, ge=1)
+    verified_metadata_days: int = Field(default=90, ge=1)
 
 
 class StatusServerConfig(BaseModel):
@@ -266,6 +334,8 @@ class AppConfig(BaseModel):
     supervisor: SupervisorConfig = Field(default_factory=SupervisorConfig)
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     sync: SyncConfig = Field(default_factory=SyncConfig)
+    chunk: ChunkConfig = Field(default_factory=ChunkConfig)
+    transfer: TransferConfig = Field(default_factory=TransferConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
     status_server: StatusServerConfig = Field(default_factory=StatusServerConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
@@ -337,15 +407,112 @@ def _expand_includes(raw: dict[str, Any], config_path: Path) -> dict[str, Any]:
     return {**raw, "plcs": expanded}
 
 
+_OFFLINE_SITE_KEYS = {
+    "version",
+    "source_node_id",
+    "central",
+    "database",
+    "supervisor",
+    "capture",
+    "sync",
+    "chunk",
+    "transfer",
+    "retention",
+    "status_server",
+    "logging",
+}
+
+
+def _default_source_node_id(lagoon_id: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", lagoon_id.strip().lower()).strip("-")
+    if not slug:
+        raise ValueError("lagoon_id cannot produce a valid source_node_id")
+    return f"edge-{slug}-01"
+
+
+def _is_site_document(raw: dict[str, Any]) -> bool:
+    return (
+        "lagoon_id" in raw
+        and "source" in raw
+        and "node" not in raw
+        and "plcs" not in raw
+    )
+
+
+def _expand_site_document(raw: dict[str, Any]) -> dict[str, Any]:
+    offline_raw = raw.get("offline")
+    if not isinstance(offline_raw, dict):
+        raise ValueError(
+            "site YAML requires an 'offline' mapping with at least offline.central"
+        )
+    unknown = set(offline_raw).difference(_OFFLINE_SITE_KEYS)
+    if unknown:
+        raise ValueError(f"unsupported offline options: {sorted(unknown)}")
+
+    central_raw = offline_raw.get("central")
+    if not isinstance(central_raw, dict):
+        raise ValueError("site YAML requires offline.central")
+    central = dict(central_raw)
+    base_url_raw = central.pop("base_url", None)
+    if base_url_raw is not None:
+        base_url = str(base_url_raw).strip().rstrip("/")
+        if not base_url:
+            raise ValueError("offline.central.base_url cannot be empty")
+        central.setdefault("health_url", f"{base_url}/health/ready")
+        central.setdefault("transfer_url", f"{base_url}/offline-transfer")
+    if not central.get("health_url") or not (
+        central.get("transfer_url") or central.get("sync_url")
+    ):
+        raise ValueError(
+            "offline.central requires base_url or health_url plus transfer_url"
+        )
+
+    lagoon_id = str(raw.get("lagoon_id") or "").strip()
+    source_node_id = str(
+        offline_raw.get("source_node_id") or _default_source_node_id(lagoon_id)
+    ).strip()
+    plc = {key: value for key, value in raw.items() if key != "offline"}
+    expanded: dict[str, Any] = {
+        "version": offline_raw.get("version", 1),
+        "node": {
+            "source_node_id": source_node_id,
+            "lagoon_id": lagoon_id,
+            "product_type": raw.get("product_type", "crystal"),
+        },
+        "central": central,
+        "plcs": [plc],
+    }
+    for section in (
+        "database",
+        "supervisor",
+        "capture",
+        "sync",
+        "chunk",
+        "transfer",
+        "retention",
+        "status_server",
+        "logging",
+    ):
+        if section in offline_raw:
+            expanded[section] = offline_raw[section]
+    return expanded
+
+
+def load_app_config(path: str | Path) -> AppConfig:
+    config_path = Path(path).resolve()
+    raw = _read_yaml(config_path)
+    try:
+        normalized = _expand_site_document(raw) if _is_site_document(raw) else raw
+        expanded = _expand_includes(normalized, config_path)
+        return AppConfig.model_validate(expanded)
+    except (ValidationError, ValueError) as exc:
+        raise ValueError(f"invalid collector configuration: {exc}") from exc
+
+
 def load_config(
     path: str | Path, environ: Mapping[str, str] | None = None
 ) -> tuple[AppConfig, RuntimeSecrets]:
-    config_path = Path(path).resolve()
-    raw = _expand_includes(_read_yaml(config_path), config_path)
-    try:
-        config = AppConfig.model_validate(raw)
-    except ValidationError as exc:
-        raise ValueError(f"invalid collector configuration: {exc}") from exc
+    config = load_app_config(path)
 
     env = os.environ if environ is None else environ
     database_url = env.get(config.database.url_env, "").strip()
