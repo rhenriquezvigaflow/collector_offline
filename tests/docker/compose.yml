@@ -1,0 +1,65 @@
+# Entirely isolated: no production configuration, endpoints, published ports or volumes.
+x-app: &app
+  image: collector-offline:test
+  pull_policy: never
+  environment:
+    COLLECTOR_CONFIG: /fixtures/site.yml
+    COLLECTOR_OFFLINE_DATABASE_URL: postgresql+psycopg2://collector_local:isolated-app-password@postgres/collector_test
+    COLLECTOR_OFFLINE_TOKEN: isolated-test-token-never-production
+  volumes:
+    - .:/fixtures:ro
+    - ${TEST_TLS_DIR:?}:/tls:ro
+  networks: [isolated]
+services:
+  postgres:
+    image: postgres:18.7-bookworm@sha256:1757c628698dd1ca67ff7a5fc386bfd91040afc62a45484c346c788b0cbe5402
+    environment:
+      POSTGRES_DB: collector_test
+      POSTGRES_PASSWORD: isolated-test-only
+      APP_DB_USER: collector_local
+      APP_DB_PASSWORD_FILE: /tls/database_password
+    volumes:
+      - data:/var/lib/postgresql
+      - ${TEST_TLS_DIR:?}:/tls:ro
+      - ../../docker/postgres-init.sh:/docker-entrypoint-initdb.d/010-app.sh:ro
+    networks: [isolated]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U postgres -d collector_test]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  central:
+    <<: *app
+    entrypoint: [python, /fixtures/mock_central.py]
+    healthcheck:
+      test: [CMD, python, -c, 'import socket; socket.create_connection(("127.0.0.1", 8090), 2).close()']
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  collector:
+    <<: *app
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      central:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -m, collector_offline.container, healthcheck]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+  tester:
+    <<: *app
+    profiles: [tools]
+    entrypoint: [python, /fixtures/scenario.py]
+networks:
+  isolated:
+    internal: true
+volumes:
+  data:

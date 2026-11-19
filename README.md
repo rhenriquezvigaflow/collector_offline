@@ -1,5 +1,19 @@
 # Collector Offline
 
+## Docker en mini PC Ubuntu Desktop 24.04
+
+La nueva distribución portable está en [INSTALACION_MINIPC.md](INSTALACION_MINIPC.md),
+[ARQUITECTURA_DOCKER.md](ARQUITECTURA_DOCKER.md) y
+[OPERACION_MANTENIMIENTO.md](OPERACION_MANTENIMIENTO.md). Usa `compose.yml` y los scripts
+de la **raíz**, con PostgreSQL persistente y configuración/secretos externos.
+La imagen no incorpora `config/` ni datos de plantas. El workflow GHCR es manual y no se
+ha ejecutado ninguna publicación. Para pruebas locales véase
+[docs/RESULTADOS_PRUEBAS.md](docs/RESULTADOS_PRUEBAS.md).
+
+Las instrucciones de instalación systemd que siguen son el método legado, con plantilla
+`config/systemd.env.example`. No ejecute ambos métodos simultáneamente. La plantilla
+`.env.example` de la raíz corresponde ahora exclusivamente a Docker.
+
 Nodo local de contingencia SCADA para Crystal Lagoons, ejecutado en Ubuntu Server 24.04.
 El Collector Central sigue siendo la fuente oficial: mientras el backend está `ONLINE`, este
 servicio no lee PLCs. Tras tres fallos consecutivos del readiness central abre una sesión,

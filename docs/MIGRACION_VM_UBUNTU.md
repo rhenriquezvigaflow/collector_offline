@@ -1,5 +1,10 @@
 # Migración de Collector Offline a una VM Ubuntu 24.04
 
+> Guía del método legado systemd. Para nuevas instalaciones Desktop use
+> [INSTALACION_MINIPC.md](../INSTALACION_MINIPC.md). No distribuya un tar genérico del
+> checkout: puede contener claves SSH o secretos; el paquete seguro usa la lista explícita
+> de `export-usb.sh`. No ejecute systemd y Compose simultáneamente.
+
 Esta guía instala el Collector Offline en una VM Linux ubicada en la planta. La VM mantendrá
 una copia local de la configuración de la laguna y una base PostgreSQL independiente llamada
 `crystal_offline`, propiedad del usuario/rol local `collector_local`.

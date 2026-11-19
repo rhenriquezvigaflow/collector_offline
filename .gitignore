@@ -14,3 +14,16 @@ logs/
 .pg-test-*/
 venv/
 collector-offline.zip
+.venv-docker/
+.venv-test/
+runtime/
+backups/
+bundles/
+test-results/
+*.dump
+*.partial
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+rhenriquez*

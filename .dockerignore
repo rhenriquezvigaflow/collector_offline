@@ -1,0 +1,15 @@
+# Allowlist: production configuration, SSH keys and Git history never enter the context.
+**
+!Dockerfile
+!pyproject.toml
+!README.md
+!requirements.lock
+!requirements-build.lock
+!src/
+!src/**
+!migrations/
+!migrations/local/
+!migrations/local/*.sql
+**/__pycache__/**
+**/*.pyc
+**/*.egg-info/**

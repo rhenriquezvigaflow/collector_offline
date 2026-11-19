@@ -1,0 +1,64 @@
+name: Build and optionally publish Collector
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (for example 0.1.0); manually publish only after validation'
+        required: true
+        type: string
+      publish:
+        description: Publish to private GHCR package
+        default: false
+        type: boolean
+permissions:
+  contents: read
+jobs:
+  container:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate version and image name
+        env:
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: |
+          pip install -r requirements.lock
+          pip install -e '.[dev]' pip-audit
+          pytest -q -m 'not postgres'
+          ruff check src tests docker
+          mypy src
+          # Existing OPC UA driver has no patched release; scoped exception documented.
+          pip-audit -r requirements.lock --no-deps --disable-pip --ignore-vuln CVE-2022-25304
+          for script in *.sh docker/*.sh scripts/test-docker.sh; do bash -n "$script"; done
+          cp .env.example .env
+          docker compose config --quiet
+      - uses: docker/setup-buildx-action@v3
+      - name: Build linux/amd64 and run isolated container tests
+        run: |
+          docker build --platform linux/amd64 -t collector-offline:test .
+          bash scripts/test-docker.sh
+      - uses: docker/login-action@v3
+        if: ${{ inputs.publish }}
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ inputs.publish }}
+          tags: |
+            ${{ env.IMAGE }}:${{ inputs.version }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          provenance: mode=min
+          sbom: true

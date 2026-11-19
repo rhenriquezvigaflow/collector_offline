@@ -34,7 +34,7 @@ for config_file in "${SOURCE_DIR}"/config/*.yml; do
 done
 if [[ ! -f /etc/crystal/collector-offline.env ]]; then
   install -m 0600 -o root -g "${SERVICE_USER}" \
-    "${SOURCE_DIR}/.env.example" /etc/crystal/collector-offline.env
+    "${SOURCE_DIR}/config/systemd.env.example" /etc/crystal/collector-offline.env
 fi
 
 runuser -u "${SERVICE_USER}" -- python3 -m venv "${APP_DIR}/.venv"

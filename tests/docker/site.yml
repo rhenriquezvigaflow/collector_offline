@@ -1,0 +1,34 @@
+version: 1
+node:
+  source_node_id: edge-docker-test
+  lagoon_id: docker-test
+central:
+  health_url: https://central:8090/health/ready
+  sync_url: https://central:8090/ingest/offline/v1/backfill
+  ca_bundle: /tls/central.crt
+  timeout_sec: 2
+  health_attempts: 1
+supervisor:
+  health_interval_sec: 1
+  failure_threshold: 3
+  recovery_threshold: 2
+sync:
+  batch_size: 500
+  lease_sec: 10
+  backoff_base_sec: 0.1
+  backoff_max_sec: 1
+  idle_interval_sec: 0.1
+retention:
+  enabled: false
+plcs:
+  - id: isolated-simulator
+    source: simulator
+    timezone: America/Santiago
+    simulator:
+      seed: 1
+      tags:
+        TEST_TEMP: 20.5
+        TEST_RUN:
+          type: bool
+          initial: false
+          change_probability: 1

@@ -88,7 +88,7 @@ class RockwellReader:
         except ImportError as exc:
             raise RuntimeError("install the 'plc' extra to use Rockwell") from exc
         driver = LogixDriver(self.ip, slot=self.slot, timeout=self.timeout)
-        driver.open()
+        driver.open()  # type: ignore[no-untyped-call]
         self._driver = driver
         self._connected_at = time.monotonic()
         self._failures = 0

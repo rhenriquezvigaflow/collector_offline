@@ -7,6 +7,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -15,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 class TagSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    address: str
+    address: str = Field(min_length=1)
     data_type: Literal["auto", "bool", "int", "float", "state"] = "auto"
     event: bool | None = None
     label: str | None = None
@@ -71,6 +72,7 @@ class PlcConfig(BaseModel):
     id: str | None = None
     lagoon_id: str | None = None
     source: Literal["rockwell", "siemens", "simulator"]
+    timezone: str = "UTC"
     tags: dict[str, TagSpec] = Field(default_factory=dict)
     event_tags: dict[str, str] = Field(default_factory=dict)
     tag_options: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -80,6 +82,15 @@ class PlcConfig(BaseModel):
     opcua_modules: list[OpcuaModuleConfig] = Field(default_factory=list)
     force_reconnect_every_sec: int = Field(default=3600, ge=30)
     max_consecutive_fails: int = Field(default=10, ge=1)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError("timezone must be an IANA zone") from exc
+        return value
 
     @field_validator("source", mode="before")
     @classmethod
@@ -290,6 +301,8 @@ class AppConfig(BaseModel):
                 configured_ids.update(module.tags)
             if plc.simulator:
                 configured_ids.update(plc.simulator.tags)
+            if any(not tag_id.strip() or len(tag_id) > 64 for tag_id in configured_ids):
+                raise ValueError("tag_id must contain 1..64 characters (central contract)")
             duplicates.update(seen.intersection(configured_ids))
             seen.update(configured_ids)
         if duplicates:
@@ -345,11 +358,12 @@ def load_config(
     try:
         config = AppConfig.model_validate(raw)
     except ValidationError as exc:
-        raise ValueError(f"invalid collector configuration: {exc}") from exc
+        errors = exc.errors(include_input=False, include_url=False)
+        raise ValueError(f"invalid collector configuration: {errors}") from exc
 
     env = os.environ if environ is None else environ
-    database_url = env.get(config.database.url_env, "").strip()
-    central_token = env.get(config.central.token_env, "").strip()
+    database_url = (secret_from_env(config.database.url_env, env) or "").strip()
+    central_token = (secret_from_env(config.central.token_env, env) or "").strip()
     missing = []
     if not database_url:
         missing.append(config.database.url_env)
@@ -361,7 +375,8 @@ def load_config(
     try:
         secrets = RuntimeSecrets(database_url=database_url, central_token=central_token)
     except ValidationError as exc:
-        raise ValueError(f"invalid runtime secrets: {exc}") from exc
+        errors = exc.errors(include_input=False, include_url=False)
+        raise ValueError(f"invalid runtime secrets: {errors}") from exc
     return config, secrets
 
 
@@ -372,4 +387,12 @@ def secret_from_env(
         return None
     env = os.environ if environ is None else environ
     value = env.get(variable_name)
+    file_path = env.get(f"{variable_name}_FILE")
+    if value and file_path:
+        raise ValueError(f"use only {variable_name} or {variable_name}_FILE")
+    if file_path:
+        try:
+            return Path(file_path).read_text(encoding="utf-8").strip() or None
+        except OSError as exc:
+            raise ValueError(f"cannot read secret file for {variable_name}") from exc
     return value if value else None

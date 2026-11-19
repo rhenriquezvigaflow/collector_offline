@@ -1,0 +1,51 @@
+# Complete con tags y direcciones aprobados antes de arrancar. Nunca contiene secretos.
+version: 1
+node:
+  source_node_id: edge-CAMBIAR-01
+  lagoon_id: CAMBIAR
+  product_type: crystal
+central:
+  health_url: https://central.example.invalid/health/ready
+  sync_url: https://central.example.invalid/ingest/offline/v1/backfill
+  token_env: COLLECTOR_OFFLINE_TOKEN
+  verify_tls: true
+  allow_private_http: false
+  timeout_sec: 10
+supervisor:
+  health_interval_sec: 60
+  failure_threshold: 3
+  recovery_threshold: 2
+  syncing_failure_threshold: 1
+capture:
+  interval_sec: 60
+sync:
+  batch_size: 250
+  lease_sec: 120
+  max_attempts: 10
+  backoff_base_sec: 2
+  backoff_max_sec: 300
+  idle_interval_sec: 2
+retention:
+  enabled: true
+  days: 90
+  batch_size: 1000
+  interval_sec: 3600
+status_server:
+  enabled: true
+  host: 127.0.0.1
+  port: 9187
+plcs:
+  - id: plc-principal
+    source: rockwell
+    timezone: America/Santiago
+    rockwell:
+      ip: CAMBIAR
+      slot: 0
+      timeout_sec: 5
+    # Para Siemens reemplace source, rockwell y tags por la definición aprobada:
+    # source: siemens
+    # siemens:
+    #   opc_server_url: opc.tcp://IP_PLC:4840
+    #   username_env: COLLECTOR_OFFLINE_PLC_USERNAME
+    #   password_env: COLLECTOR_OFFLINE_PLC_PASSWORD
+    tags: {}
